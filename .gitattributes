@@ -1,0 +1,2 @@
+# Mark interactive maps as generated so GitHub counts R as the primary language
+Maps/Interactive/*.html linguist-generated=true
