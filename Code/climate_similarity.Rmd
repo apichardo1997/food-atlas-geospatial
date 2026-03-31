@@ -1,0 +1,265 @@
+---
+title: "Climate Similarity using Koppen-Geiger Classification"
+author: "Ana"
+date: "2026-03-25"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+---
+
+## Setup
+
+Install any missing packages first (only need to run once):
+
+```{r install-packages, eval=FALSE}
+install.packages(c("terra", "sf", "rnaturalearth", "rnaturalearthdata",
+                    "exactextractr", "dplyr", "tidyr", "data.table"))
+```
+
+Load libraries:
+
+```{r setup, message=FALSE, warning=FALSE}
+rm(list = ls())
+
+library(terra)
+library(sf)
+library(rnaturalearth)
+library(exactextractr)
+library(dplyr)
+library(tidyr)
+library(data.table)
+```
+
+Set working directory to the project folder:
+
+```{r set-wd}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+## Step 1: Load Raster and World Map
+
+We use the Koppen-Geiger climate classification raster from Beck et al. (2023), which classifies every pixel on Earth into one of 30 climate zones. We use the 1991--2020 period at 0.1 degree resolution (~11km per pixel).
+
+The world country polygons come from `ne_countries` in the `rnaturalearth` package (same shapefile used by the rest of the team for consistency).
+
+**Data source:** Beck, H. E. et al. (2023). High-resolution (1 km) Koppen-Geiger maps for 1901--2099 based on constrained CMIP6 projections. *Scientific Data*. Downloaded from https://www.gloh2o.org/koppen/
+
+```{r load-data}
+koppen_raster <- rast("../Data/Raw/1991_2020/koppen_geiger_0p1.tif")
+koppen_raster
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+```
+
+The raster values are integers 1--30, each corresponding to a Koppen-Geiger climate class:
+
+```{r legend}
+koppen_legend <- data.frame(
+  value = 1:30,
+  code = c("Af","Am","Aw","BWh","BWk","BSh","BSk","Csa","Csb","Csc",
+           "Cwa","Cwb","Cwc","Cfa","Cfb","Cfc","Dsa","Dsb","Dsc","Dsd",
+           "Dwa","Dwb","Dwc","Dwd","Dfa","Dfb","Dfc","Dfd","ET","EF"),
+  description = c("Tropical rainforest","Tropical monsoon","Tropical savannah",
+                   "Arid desert hot","Arid desert cold","Arid steppe hot","Arid steppe cold",
+                   "Temperate dry summer hot","Temperate dry summer warm","Temperate dry summer cold",
+                   "Temperate dry winter hot","Temperate dry winter warm","Temperate dry winter cold",
+                   "Temperate no dry hot","Temperate no dry warm","Temperate no dry cold",
+                   "Cold dry summer hot","Cold dry summer warm","Cold dry summer cold","Cold dry summer very cold winter",
+                   "Cold dry winter hot","Cold dry winter warm","Cold dry winter cold","Cold dry winter very cold winter",
+                   "Cold no dry hot","Cold no dry warm","Cold no dry cold","Cold no dry very cold winter",
+                   "Polar tundra","Polar frost")
+)
+knitr::kable(koppen_legend, caption = "Koppen-Geiger Climate Classification Legend")
+```
+
+Quick visual check of the raster:
+
+```{r plot-raster, fig.width=10, fig.height=5}
+plot(koppen_raster, main = "Koppen-Geiger Climate Zones (1991-2020)")
+```
+
+## Step 2: Extract Climate Zones Per Country
+
+We overlay each country polygon on the raster using `exact_extract()`. This returns every raster pixel that falls inside each country, along with a `coverage_fraction` value that accounts for partial pixels at borders.
+
+```{r extract}
+climate_extract <- exact_extract(
+  koppen_raster,
+  world,
+  include_cols = "iso_a3"
+)
+
+climate_df <- bind_rows(climate_extract)
+names(climate_df)[names(climate_df) == "value"] <- "climate_zone"
+
+cat("Total pixels extracted:", nrow(climate_df), "\n")
+head(climate_df)
+```
+
+## Step 3: Calculate Share of Each Climate Zone Per Country
+
+For each country, we compute the fraction of its total land area that falls in each Koppen zone. We use `coverage_fraction` as the weight so that partial border pixels are handled correctly. Ocean pixels (value = 0) and countries with missing ISO codes are dropped.
+
+```{r shares}
+climate_shares <- climate_df %>%
+  filter(!is.na(climate_zone), climate_zone != 0) %>%
+  group_by(iso_a3, climate_zone) %>%
+  summarise(area = sum(coverage_fraction), .groups = "drop") %>%
+  group_by(iso_a3) %>%
+  mutate(share = area / sum(area)) %>%
+  ungroup() %>%
+  select(iso_a3, climate_zone, share)
+
+climate_shares <- climate_shares %>%
+  filter(!is.na(iso_a3), iso_a3 != "-99")
+
+cat("Countries with climate data:", n_distinct(climate_shares$iso_a3), "\n")
+```
+
+**Sanity check:** Spain should be mostly arid steppe cold (BSk = 7) and Mediterranean (Csa = 8, Csb = 9):
+
+```{r check-spain}
+spain <- climate_shares %>%
+  filter(iso_a3 == "ESP") %>%
+  arrange(desc(share)) %>%
+  left_join(koppen_legend, by = c("climate_zone" = "value"))
+knitr::kable(spain, digits = 3, caption = "Climate zone shares for Spain")
+```
+
+## Step 4: Compute Bilateral Climate Similarity
+
+We measure climate similarity between each pair of countries using the **same overlap method** as the Finger-Kreinin index used for food similarity:
+
+$$\text{Climate Similarity}_{ij} = \sum_{z=1}^{30} \min(s_{iz}, s_{jz}) \times 100$$
+
+where $s_{iz}$ is country $i$'s share of land area in climate zone $z$. The score ranges from 0 (completely different climates) to 100 (identical climate distributions).
+
+We pivot the shares into a wide matrix for fast vectorized computation.
+
+```{r similarity}
+climate_wide <- climate_shares %>%
+  pivot_wider(
+    id_cols = iso_a3,
+    names_from = climate_zone,
+    values_from = share,
+    values_fill = 0
+  )
+
+country_ids <- climate_wide$iso_a3
+climate_mat <- as.matrix(climate_wide[, -1])
+rownames(climate_mat) <- country_ids
+
+n <- length(country_ids)
+pairs <- combn(n, 2)
+
+cat("Calculating similarity for", ncol(pairs), "country pairs...\n")
+
+similarity_vec <- sapply(seq_len(ncol(pairs)), function(k) {
+  sum(pmin(climate_mat[pairs[1, k], ], climate_mat[pairs[2, k], ]))
+})
+
+climate_similarity <- data.frame(
+  iso3_1 = country_ids[pairs[1, ]],
+  iso3_2 = country_ids[pairs[2, ]],
+  climate_similarity = similarity_vec * 100
+)
+
+cat("Done!", nrow(climate_similarity), "pairs computed\n")
+```
+
+## Step 5: Sanity Checks
+
+We verify the results against intuitive expectations. We use a helper function to look up pairs regardless of ordering:
+
+```{r sanity-checks}
+lookup_pair <- function(df, c1, c2) {
+  df %>% filter(
+    (iso3_1 == c1 & iso3_2 == c2) | (iso3_1 == c2 & iso3_2 == c1)
+  )
+}
+
+cat("Spain & Italy (both Mediterranean, expect HIGH):\n")
+lookup_pair(climate_similarity, "ESP", "ITA")
+
+cat("\nNorway & Brazil (expect LOW):\n")
+lookup_pair(climate_similarity, "NOR", "BRA")
+
+cat("\nGermany & France (both temperate, expect MODERATE-HIGH):\n")
+lookup_pair(climate_similarity, "DEU", "FRA")
+
+cat("\nJapan & USA (both span many zones, expect MODERATE):\n")
+lookup_pair(climate_similarity, "JPN", "USA")
+```
+
+Top 10 most and least similar country pairs:
+
+```{r top-bottom}
+cat("Most similar:\n")
+climate_similarity %>% arrange(desc(climate_similarity)) %>% head(10)
+
+cat("\nLeast similar:\n")
+climate_similarity %>% arrange(climate_similarity) %>% head(10)
+```
+
+Distribution of climate similarity scores:
+
+```{r distribution, fig.width=8, fig.height=4}
+hist(climate_similarity$climate_similarity,
+     breaks = 50,
+     main = "Distribution of Bilateral Climate Similarity Scores",
+     xlab = "Climate Similarity (0-100)",
+     col = "steelblue",
+     border = "white")
+abline(v = mean(climate_similarity$climate_similarity), col = "red", lwd = 2, lty = 2)
+legend("topright",
+       legend = paste("Mean =", round(mean(climate_similarity$climate_similarity), 1)),
+       col = "red", lwd = 2, lty = 2)
+```
+
+## Step 6: Save Results
+
+```{r save}
+fwrite(climate_similarity, "../Data/Processed/climate_similarity.csv")
+cat("Saved to Processed Data/climate_similarity.csv\n")
+```
+
+## Step 7: Merge into data_final.csv
+
+The country pairs in `data_final.csv` are ordered by M49 numeric code, not alphabetically by ISO3. To match correctly, we create a canonical alphabetical key for both datasets before joining.
+
+```{r merge}
+data_final <- fread("../Data/Processed/data_final.csv")
+
+# Remove climate_similarity column if it already exists (from a previous run)
+if ("climate_similarity" %in% names(data_final)) {
+  data_final[, climate_similarity := NULL]
+}
+
+climate_sim_merge <- climate_similarity %>%
+  mutate(
+    key_1 = pmin(iso3_1, iso3_2),
+    key_2 = pmax(iso3_1, iso3_2)
+  ) %>%
+  select(key_1, key_2, climate_similarity)
+
+data_final <- data_final %>%
+  mutate(
+    key_1 = pmin(iso3_o, iso3_d),
+    key_2 = pmax(iso3_o, iso3_d)
+  ) %>%
+  left_join(climate_sim_merge, by = c("key_1", "key_2")) %>%
+  select(-key_1, -key_2)
+
+cat("Rows with climate data:", sum(!is.na(data_final$climate_similarity)),
+    "out of", nrow(data_final), "\n")
+cat("Missing:", sum(is.na(data_final$climate_similarity)), "\n")
+```
+
+Save the updated dataset:
+
+```{r save-final}
+fwrite(data_final, "../Data/Processed/data_final.csv")
+cat("Updated data_final.csv saved\n")
+```

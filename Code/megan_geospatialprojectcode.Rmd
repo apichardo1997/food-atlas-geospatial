@@ -1,0 +1,331 @@
+---
+title: "Geographic Determinants of Food Similarity"
+subtitle: "Lisbeth Nordmeyer, Anabel Pichardo, Tianqin Tina Wang, Megan Yeo"
+output: pdf_document
+date: "2026-03-25"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(spData)
+library(tidyverse)
+library(readxl)
+library(elevatr)
+library(mapview)
+library(viridis)
+library(raster)
+library(shapefiles)
+library(stringdist)
+library(fuzzyjoin)
+library(units)
+library(terra)
+library(leaflet)
+library(fixest)
+library(tibble)
+library(rnaturalearth)
+library(arrow)
+library(data.table)
+library(viridis)
+library(grDevices)
+```
+## Intro and Research Question
+Over the past decades, the global food landscape has been transformed by deepening economic integration. The spread of international trade networks, multinational food corporations, and global supply chains has made similar food products accessible across increasingly distant regions. Yet, persistent differences in consumption patterns suggest that geography continues to impose important constraints on what people eat. While a substantial body of research has examined how geography shapes diets within countries or specific regions, less is known about how it influences similarity in diets between countries on a global scale.
+
+We address the following research question: To what extent do geographic and socioeconomic factors explain dietary similarity between countries? We conceptualize dietary similarity as a dyadic outcome between country pairs and investigate how it is influenced by geographic proximity (e.g., distance, shared borders), environmental similarity (e.g., climate zones, elevation, coastal access), as well as socioeconomic and historical factors such as GDP per capita differences, trade integration, and shared cultural or colonial ties.
+
+To answer this question, we combine detailed food consumption data from the Food and Agriculture Organization (FAO) Food Balance Sheets with global datasets on geography, climate, trade, and economic development. We construct a bilateral food similarity index based on consumption shares across food categories and estimate gravity-style regressions to identify the key determinants of similarity. Our empirical analysis covers two points in time, 2010 and 2023, allowing us to assess both cross-sectional patterns and changes over time.
+
+Our findings indicate that geography remains a strong and robust determinant of dietary similarity: countries that are geographically closer, share borders, or exhibit similar environmental conditions tend to have significantly more similar diets. At the same time, socioeconomic factors, particularly trade integration and shared historical ties, also play an important role, suggesting that globalization reinforces, but does not fully override, geographic patterns. Overall, the results highlight that while global diets may be converging, geography continues to exert a persistent influence on what people eat.
+
+
+# Motivation and Literature Review
+
+Research has long documented the fact that geography has a significant impact on people’s diets. For example, the Eurobarometer survey found that “proximity to the sea strongly influences higher consumption of fish and seafood” (European Commission, 2025), while a study on the Tibetan plateau highlights that the high altitude of the area results in the traditional diet being centered around livestock (Wang et. al., 2023). There are also well-documented similarities in food by region, such as countries like France, Italy, Spain and Greece tending to adhere to Mediterranean diets (Mertens et. al. 2018). 
+
+At the same time, there has been some literature documenting the relationship between geography and similarity in diet between countries. Zhu et. al. (2013) analyze geography and the regional similarity of food in China, while Mertens et. al. (2018) document similarity between selected European countries. We note that most of these studies have done so on a regional or country-specific level; our paper aims to do this analysis on a global scale.
+
+In our paper, we investigate a few geographic variables that are likely significant determinants of diets: distance between countries, shared borders, (similarity in) climate zones, elevation, and distance to water bodies. 
+
+# Data Description
+We use the UN Food and Agriculture Organization’s Food Balance Sheets, which contains country-level data on the “pattern of a country’s food supply during a specified reference period”, including the amount consumed for each category of food (e.g. “Wheat and products”, “Groundnuts”, “Bovine meat”). To capture evolution over time, we use both 2010 and 2023 (earliest and latest available, respectively) data. 
+
+Data sources are as follows:
+\begin{itemize}
+  \item Distance between countries: CEPII Geodist, Calculated ourselves
+  \item Populated-weighted mean elevation: population raster data from WorldPop, elevation data from terra package in R
+  \item Climate zones: Koppen Geiger Climate Zones raster data
+  \item Distance to water bodies: Distance to coastline calculated ourselves
+  \item Gravity controls (common language, religious proximity index, common colonizer post 1945, colonial relationship post 1945, currently engaged in regional trade agreement): CEPII gravity
+  \item Bilteral trade volume: CEPII BACI
+  \item GDP Per Capita, PPP: World Bank
+  \item Population: World Bank
+\end{itemize}
+
+# Methodology
+
+\textbf{Computation of Food Similarity Scores}:
+We draw heavily from the methodology of the Country Food Similarity Index in calculating food similarity scores. While they do not specify the specific method by which they calculate similarity, we use the “Finger-Kreinin Index” commonly employed in trade literature to measure similarity in trade baskets (Finger and Kreinin, 1979). For each country, we first calculate the share of each category of food as a proportion of total consumption. For each country pair $j$ and $k$, we then calculate the overlapping share index as follows:
+
+$$\sum_i min(s_{i,j}, s_{i, k})$$ 
+where $s_{i,j}$ is consumption of food in category $i$ as a share of total consumption for country $j$, and $s_{i,k}$ is consumption of category $i$ as a share of total consumption for country $k$.
+
+For instance, if “Wheat and products” constitutes a 0.01 share of total consumption in Spain and 0.02 share in France, the overlapping share is 0.01. Shares of consumption are calculated based on energy / kcal / day, which the UN FAO also frequently employs.
+
+The similarity score is then calculated as a weighted sum of the overlapping shares by country pair. Following the methodology of the Country Food Similarity Index, we assign a 30%, 30% and 40% weighting respectively to meat and dairy, starch, and fruit and vegetables, which delivers the most realistic similarity score between countries. 
+
+As the Country Food Similarity Index also highlights, we note a few limitations in our calculation of similarity: while our study generalizes food consumption on a national level, we acknowledge that within a country there can be large disparities in cuisine. Since the UN FAO data only exi sts by country, however, we are unable to capture these nuances. Furthermore, we are only able to determine food similarity based on consumption of raw ingredients: we acknowledge that other factors like recipes and preparation methods are not reflected in our study. 
+
+Based on a visual inspection, this methodology generally yields sensible results. As expected, for instance, countries in the Mediterranean region have very high similarity scores, as do countries in geographical regions like Southeast Asia.
+
+\textbf{Regression:} We estimate a gravity model (estimate Pooled OLS with Dyadic-Robust Standard Errors).
+
+We estimate cross-sectional gravity-type regressions to examine the determinants of bilateral food similarity across countries. The unit of observation is a country pair. All models are estimated separately for 2010 and 2023.
+
+The dependent variable is a continuous index of food similarity between two countries. The main explanatory variables include bilateral trade intensity, geographic distance, and standard gravity controls capturing cultural and historical proximity, such as common language, common religion, colonial ties, and trade agreements.
+
+To account for unobserved country-specific heterogeneity, we include country fixed effects for both members of each pair. Standard errors are clustered at the country level in both dimensions (i.e., by each country in the dyad), allowing for arbitrary correlation of errors across dyads sharing a common country.
+
+## Data Cleaning
+
+```{r clean, eval = FALSE}
+food_data = read_csv("FoodBalanceSheets_E_All_Data_(Normalized).csv")
+codes_updated <- read_csv("codes_updated.csv")
+codes_updated = unique(codes_updated)
+m49_country_area_codes <- read_csv("m49_country_area_codes.csv")
+
+## DATA CLEANING
+# Get latest year available
+food_data = food_data %>% filter(Year == 2023 | Year == 2010)
+
+# Filter for supply (using energy use/kcal/day)
+food_data = food_data %>% filter(`Element Code` == 664)
+
+# Merge in codes that classifies food into categories (starches, vegetal products, meat)
+food_data = food_data %>% left_join(codes_updated, 
+                                    by = "Item Code")
+food_data = food_data %>% filter(!is.na(category))
+
+# Calculate shares of total energy consumption
+food_data = food_data %>%
+  group_by(Area) %>% 
+  mutate(share = Value/sum(Value)) %>%
+  ungroup()
+
+food_data = food_data %>%
+  mutate(area_code = `Area Code (M49)`,
+         element_code = `Element Code`,
+         item_code = `Item Code`) %>%
+  select(area_code, item_code, Area, Item, share, category)
+
+food_data$area_code <- sub("^'", "", food_data$area_code)
+food_data = food_data %>%
+  mutate(area_code = as.numeric(area_code))
+
+```
+
+
+## Calculate dietary similarity index between countries
+
+```{r foodsimilarity, eval = FALSE}
+# This uses an overlap in distribution method to calculate the similarity index
+group_similarity <- function(df, c1, c2, groupname){
+  
+  d1 <- df %>% filter(area_code == c1, category == groupname)
+  d2 <- df %>% filter(area_code == c2, category == groupname)
+  
+  merged <- full_join(d1, d2, by="Item", suffix=c("_1","_2")) %>%
+    mutate(
+      share_1 = replace_na(share_1,0),
+      share_2 = replace_na(share_2,0)
+    )
+  
+  sum(pmin(merged$share_1, merged$share_2))
+}
+
+food_data = food_data %>% filter(area_code %in% m49_country_area_codes$area_code) 
+  
+countries <- unique(food_data$area_code)
+pairs <- expand.grid(c1 = countries, c2 = countries) %>%
+  filter(c1 < c2)
+
+food_data = food_data %>% filter(category != "beverages")
+
+similarity_results <- pairs %>%
+  rowwise() %>%
+  mutate(
+    sim_meat  = group_similarity(food_data, c1, c2, "meat"),
+    sim_starch = group_similarity(food_data, c1, c2, "starch"),
+    sim_fv = group_similarity(food_data, c1, c2, "vegetal_products"),
+    
+    similarity =
+      100 * (
+        0.30 * sim_meat +
+          0.30 * sim_starch +
+          0.40 * sim_fv
+      )
+  )
+
+country_1_list = food_data %>% select(area_code, `Area`) %>%
+  mutate("c1" = area_code,
+         "country_1" = `Area`) %>%
+  select(-c(area_code, `Area`)) %>%
+  unique()
+
+country_2_list = food_data %>% select(area_code, `Area`) %>%
+  mutate("c2" = area_code,
+         "country_2" = `Area`) %>%
+  select(-c(area_code, `Area`)) %>%
+  unique()
+
+similarity_results = similarity_results %>%
+  left_join(country_1_list,
+            by = "c1")
+
+similarity_results = similarity_results %>%
+  left_join(country_2_list,
+            by = "c2")
+
+write.csv(similarity_results, "similarity_results.csv", row.names = FALSE)
+```
+
+## Sanity check
+Print some examples of countries with the most similar diets
+
+```{r sanitycheck}
+similarity_results = read_csv("similarity_results.csv")
+similarity_results %>% 
+  filter(country_1 == "Indonesia" | country_2 == "Indonesia") %>%
+  arrange(desc(similarity)) %>%
+  head()
+
+similarity_results %>% 
+  filter(country_1 == "Spain" | country_2 == "Spain") %>%
+  arrange(desc(similarity)) %>%
+  head()
+```
+Generally expected, some surprises (e.g. Liberia for Indonesia), but to be expected given that this measure is based on quantity of each food category consumed and not specific cuisines. 
+
+## Calculation of populated-weighted elevation similarity
+Here, we calculate the average elevation in each country, weighted by population. To calculate a similarity score, we take the negative log difference between weighted average elevations.
+
+```{r elevation, eval = FALSE}
+population = raster("global_pop.tif") 
+countries = read_sf("ne_10m_admin_0_countries/ne_10m_admin_0_countries.shp") 
+data_final <- read_csv("data_final.csv")
+elevation_mask = raster("elevation_mask.tif") 
+
+# Calculate elevation raster
+elevation <- get_elev_raster(countries, z = 5)
+countries_shape = vect(countries)
+elevation_mask = mask(elevation, countries)
+writeRaster(elevation_mask, "elevation_mask.tif")
+
+# Reproject Data
+population <- rast(population)
+elevation_mask <- rast(elevation_mask)
+countries <- st_transform(countries, crs(elevation_mask))
+population <- project(population, elevation_mask)
+
+# Calculate mean elevation weighted by population
+weighted = population * elevation_mask
+weighted_sum = zonal(weighted, countries_shape, fun = "sum", na.rm = TRUE)
+pop_sum = zonal(population, countries_shape, fun = "sum", na.rm = TRUE)
+weighted_mean = weighted_sum / pop_sum
+countries$weighted_elevation = weighted_mean$global_pop
+st_write(countries, "countries_elevation.shp")
+
+# Merge data into panel
+countries_o = countries %>% select(ISO_A3, weighted_elevation) %>%
+  mutate(iso3_o = ISO_A3,
+         weighted_elevation_o = weighted_elevation) %>%
+  st_drop_geometry() %>%
+  select(-c(ISO_A3, weighted_elevation))
+
+countries_d = countries %>% select(ISO_A3, weighted_elevation) %>%
+  mutate(iso3_d = ISO_A3,
+         weighted_elevation_d = weighted_elevation) %>%
+  st_drop_geometry() %>%
+  select(-c(ISO_A3, weighted_elevation))
+
+data_final = data_final %>% left_join(countries_o, by = "iso3_o")
+data_final = data_final %>% left_join(countries_d, by = "iso3_d")
+
+# Calculate elevation difference
+data_final = data_final %>%
+  mutate(elevation_similarity = -log(abs(weighted_elevation_o - weighted_elevation_d)))
+
+data_final = data_final %>%
+  select(-c(weighted_elevation_o, weighted_elevation_d))
+```
+
+```{r}
+data_final_geo = read_csv("data_final_geo.csv")
+countries_elevation = read_sf("countries_elevation.shp")
+
+ggplot(data = countries_elevation) +
+  geom_sf(
+    fill = "grey80",
+    color = "white",
+    linewidth = 0.1,
+    inherit.aes = FALSE
+  ) +
+  geom_sf(
+    aes(fill = log(wghtd_l)),
+    color = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    na.value = "grey80",
+    name = "Log Population-Weighted\n Avg. Elevation"
+  ) +
+  labs(
+    title = "Log Population-Weighted Average Elevation",
+    caption = "Source: Own calculations, R Terra Package"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+elevation_similarity_map <- data_final_geo %>%
+  group_by(iso3_o, year) %>%
+  summarise(mean_similarity = mean(elevation_similarity, na.rm = TRUE), .groups = "drop")
+
+world_map <- ne_countries(scale = "medium", returnclass = "sf") %>%
+  dplyr::select(adm0_a3, geometry)
+
+map_data <- world_map %>%
+  left_join(elevation_similarity_map, by = c("adm0_a3" = "iso3_o"))
+
+plot_data <- map_data %>%
+  filter(year %in% c(2010))
+
+ggplot(data = plot_data) +
+  # background: all countries, repeated in each facet
+  geom_sf(
+    data = world_map,
+    fill = "grey80",
+    color = "white",
+    linewidth = 0.1,
+    inherit.aes = FALSE
+  ) +
+  # overlay: only countries that have similarity values
+  geom_sf(
+    aes(fill = mean_similarity),
+    color = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    na.value = "grey80",
+    name = "Avg. Elevation \nSimilarity"
+  ) +
+  labs(
+    title = "Average Population-Weighted Elevation Similarity by Country",
+    caption = "Source: Own calculations, R Terra Package"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Note: lower value indicates a greater average elevation difference from other countries. Additionally, some countries are missing because this plots elevation similarity for countries included in the food similarity panel

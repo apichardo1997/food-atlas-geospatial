@@ -1,0 +1,39 @@
+# Large raw data files (publicly available — see README for download links)
+Data/Raw/FoodBalanceSheets_E_All_Data_(Normalized).csv
+Data/Raw/koppen_geiger_tif.zip
+
+# Large processed files (reproducible from code + raw data)
+Data/Processed/countries_elevation.csv
+Data/Processed/countries_elevation.shp
+Data/Processed/countries_elevation.shx
+Data/Processed/countries_elevation.dbf
+Data/Processed/countries_elevation.prj
+
+# Interactive map Leaflet dependencies (auto-generated)
+Maps/Interactive/*_files/
+
+# Website (deployed separately)
+Website/
+
+# R artifacts
+.Rproj.user/
+.Rhistory
+.RData
+*.Rproj
+
+# Broken symlink
+Data/Data
+
+# Playwright MCP logs
+.playwright-mcp/
+
+# LaTeX build artifacts
+*.log
+*.tex
+*.aux
+*.out
+Code/texput.log
+
+# OS files
+.DS_Store
+Thumbs.db

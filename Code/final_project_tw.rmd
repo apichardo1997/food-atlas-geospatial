@@ -1,0 +1,573 @@
+---
+title: "Global Food Similarity: Determinants and Trends (2010–2023)"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+## Setup
+
+Load required packages.
+
+```{r packages}
+library(sf)
+library(spData)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(units)
+library(leaflet)
+library(fixest)
+library(tibble)
+library(rnaturalearth)
+library(arrow)
+library(data.table)
+library(viridis)
+library(grDevices)
+library(countrycode)
+
+```
+
+---
+
+## 1. Data Import & Cleaning
+
+### 1.1 Import Raw Data
+
+The section reads in cleaned FAO food data and the bilateral similarity scores created from it, CEPII BACI trade flows, the CEPII gravity dataset, and World Bank GDP per capita data.
+
+```{r import}
+food_data_2023    <- fread("data/food_data_2023.csv")
+food_data_2010    <- fread("data/food_data_2010.csv")
+similarity_2010   <- fread("data/similarity_results_2010.csv")
+similarity_2023   <- fread("data/similarity_results_2023.csv")
+gravity           <- fread("data/Gravity_csv_V202211/Gravity_V202211.csv")[year >= 2010 & year <= 2021]
+trade_country     <- fread("data/BACI_HS22_V202601/country_codes_V202601.csv")
+trade2023         <- fread("data/BACI_HS22_V202601/BACI_HS22_Y2023_V202601.csv")
+gdp               <- fread("data/world_bank_gdp/world_bank_gdp.csv", header = TRUE)
+```
+
+### 1.2 Clean BACI Trade Data
+
+We merge trade flows with country codes and aggregate them to bilateral totals.
+
+```{r clean-baci}
+baci <- trade2023 %>%
+  left_join(trade_country, by = c("i" = "country_code")) %>%
+  rename(iso3_o = country_iso3, country_name_o = country_name, iso2_o = country_iso2) %>%
+  left_join(trade_country, by = c("j" = "country_code")) %>%
+  rename(iso3_d = country_iso3, country_name_d = country_name, iso2_d = country_iso2)
+
+baci_bilateral <- baci %>%
+  group_by(t, iso3_o, iso3_d) %>%
+  summarise(trade_value = sum(v, na.rm = TRUE), .groups = "drop") %>%
+  rename("year" = "t", "trade_total" = "trade_value")
+```
+
+### 1.3 Filter Gravity Controls
+
+We keep only relevant variables from the CEPII gravity dataset (religious proximity index, shared official language, colonial relationship post 1945, common colonizer post 1945, regional trade agreement, social connectedness). We also import geodesic distance variables, but use our own calculated distance variables in the final analysis sample. We use 2021 values as time-invariant controls throughout.
+
+```{r clean-gravity}
+gravity_filtered <- gravity %>%
+  select(year, country_id_o, country_id_d, iso3_o, iso3_d, iso3num_o, iso3num_d,
+         comlang_off, comrelig, col45, comcol, fta_wto, tradeflow_baci,
+         scaled_sci_2021, dist, distcap) %>%
+  group_by(pmin(iso3_o, iso3_d), pmax(iso3_o, iso3_d)) %>%
+  mutate(trade_total = sum(tradeflow_baci, na.rm = TRUE)) %>%
+  ungroup()
+
+gravity_controls <- gravity %>%
+  filter(year == 2021, country_exists_o == 1, country_exists_d == 1) %>%
+  select(iso3_o, iso3_d, comlang_off, comrelig, col45, comcol, fta_wto,
+         scaled_sci_2021, dist, distcap) %>%
+  rename_with(~ paste0(., "_2021"), -c(iso3_o, iso3_d, scaled_sci_2021))
+```
+
+### 1.4 Clean GDP Data
+
+Reshape World Bank GDP per capita from wide to long format.
+
+```{r clean-gdp}
+gdp_clean <- gdp %>%
+  select("Country Code", "2010", "2023")
+
+gdp_long <- gdp_clean %>%
+  pivot_longer(cols = c("2010", "2023"), names_to = "year", values_to = "gdp_pc") %>%
+  rename(iso3 = "Country Code") %>%
+  mutate(year = as.integer(year))
+```
+
+### 1.5 Harmonise FAO Country Codes
+
+Convert UN M49 numeric codes to ISO3 using the `countrycode` package.
+
+```{r clean-fao}
+similarity_merged <- bind_rows(
+  similarity_2010 %>% mutate(year = 2010),
+  similarity_2023 %>% mutate(year = 2023)
+) %>%
+  mutate(
+    iso3_o = countrycode(c1, origin = "un", destination = "iso3c"),
+    iso3_d = countrycode(c2, origin = "un", destination = "iso3c")
+  ) %>%
+  rename("m49_1" = "c1", "m49_2" = "c2")
+
+food_merged <- bind_rows(
+  food_data_2010 %>% mutate(year = 2010),
+  food_data_2023 %>% mutate(year = 2023)
+) %>%
+  mutate(iso3c = countrycode(area_code, origin = "un", destination = "iso3c"))
+```
+
+### 1.6 Build Final Panel Dataset
+
+Join similarity scores with trade flows, gravity controls, and GDP for both 2010 and 2023. Compute the absolute GDP per capita difference as a proxy for income dissimilarity.
+
+```{r final-merge}
+trade_2010 <- gravity %>%
+  filter(year == 2010) %>%
+  select(iso3_o, iso3_d, tradeflow_baci) %>%
+  group_by(iso3_o, iso3_d) %>%
+  summarise(trade_total = sum(tradeflow_baci, na.rm = TRUE), .groups = "drop")
+
+data_2010 <- similarity_merged %>%
+  filter(year == 2010) %>%
+  left_join(trade_2010, by = c("iso3_o", "iso3_d")) %>%
+  left_join(gravity_controls, by = c("iso3_o", "iso3_d")) %>%
+  mutate(year = 2010)
+
+data_2023 <- similarity_merged %>%
+  filter(year == 2023) %>%
+  left_join(baci_bilateral %>% filter(year == 2023), by = c("iso3_o", "iso3_d", "year")) %>%
+  left_join(gravity_controls, by = c("iso3_o", "iso3_d")) %>%
+  mutate(year = 2023)
+
+data_final <- bind_rows(data_2010, data_2023) %>%
+  left_join(gdp_long, by = c("iso3_o" = "iso3", "year")) %>%
+  rename(gdp_pc_o = gdp_pc) %>%
+  left_join(gdp_long, by = c("iso3_d" = "iso3", "year")) %>%
+  rename(gdp_pc_d = gdp_pc) %>%
+  mutate(gdp_pc_diff = abs(gdp_pc_o - gdp_pc_d))
+
+head(data_final)
+
+data_final %>%
+  summarise(missing_gdp = sum(is.na(gdp_pc_o) | is.na(gdp_pc_d)))
+
+fwrite(data_final, "data/data_final.csv")
+```
+
+---
+
+## 2. Geographical Variables
+
+### 2.1 Load Spatial Data
+
+Download world country polygons, populated places, and coastline from Natural Earth.
+
+```{r load-spatial}
+world_main    <- ne_countries(scale = "medium", returnclass = "sf")
+cities_main   <- ne_download(scale = "medium", type = "populated_places",
+                              category = "cultural", returnclass = "sf")
+cities_main   <- cities_main %>% rename_with(tolower)
+coastline_main <- ne_download(scale = "medium", type = "coastline",
+                               category = "physical", returnclass = "sf")
+```
+
+### 2.2 Centroid Distance Matrix
+
+Compute pairwise distances between country surface points and reshape to a long bilateral data frame.
+
+```{r centroid-dist}
+world <- world_main %>%
+  filter(!is.na(adm0_a3), adm0_a3 != "-99") %>%
+  select(adm0_a3, geometry) %>%
+  group_by(adm0_a3) %>%
+  summarise(geometry = st_union(geometry), .groups = "drop") %>%
+  st_make_valid()
+
+world_pts    <- st_point_on_surface(world)
+dist_matrix  <- st_distance(world_pts)
+dist_matrix  <- drop_units(set_units(dist_matrix, "km"))
+rownames(dist_matrix) <- world$adm0_a3
+colnames(dist_matrix) <- world$adm0_a3
+
+dist_df <- as.data.frame(dist_matrix) %>%
+  rownames_to_column("iso3_o") %>%
+  pivot_longer(cols = -iso3_o, names_to = "iso3_d", values_to = "dist_km") %>%
+  filter(iso3_o != iso3_d)
+```
+
+### 2.3 Population-Weighted Centroid Distance
+
+Calculate each country's centroid as the population-weighted mean of city coordinates. This provides a better approximation of where economic activity is concentrated, thus we use this measure in our analysis.
+
+```{r pop-centroid}
+coords <- st_coordinates(cities_main)
+
+pop_centroids <- cities_main %>%
+  mutate(x = coords[, 1], y = coords[, 2]) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(adm0_a3), adm0_a3 != "-99", !is.na(pop_max)) %>%
+  group_by(adm0_a3) %>%
+  summarise(
+    x = weighted.mean(x, pop_max, na.rm = TRUE),
+    y = weighted.mean(y, pop_max, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326)
+
+pop_dist_matrix  <- st_distance(pop_centroids)
+pop_dist_matrix  <- drop_units(set_units(pop_dist_matrix, "km"))
+rownames(pop_dist_matrix) <- pop_centroids$adm0_a3
+colnames(pop_dist_matrix) <- pop_centroids$adm0_a3
+
+pop_dist_df <- as.data.frame(pop_dist_matrix) %>%
+  rownames_to_column("iso3_o") %>%
+  pivot_longer(cols = -iso3_o, names_to = "iso3_d", values_to = "pop_dist_km") %>%
+  filter(iso3_o != iso3_d)
+```
+
+### 2.4 Shared Borders
+
+Use `st_touches()` to identify contiguous country pairs and create a binary adjacency indicator.
+
+```{r shared-borders}
+border_mat <- st_touches(world, sparse = FALSE)
+dimnames(border_mat) <- list(world$adm0_a3, world$adm0_a3)
+
+border_df <- as.data.frame(border_mat) %>%
+  rownames_to_column("iso3_o") %>%
+  pivot_longer(cols = -iso3_o, names_to = "iso3_d", values_to = "shared_border") %>%
+  mutate(shared_border = as.integer(shared_border)) %>%
+  filter(iso3_o != iso3_d)
+```
+
+### 2.5 Coastal Access
+
+Compute each country's coastal status (1/0) and shortest distance to the nearest coastline. Coastal countries get distance = 0.
+
+```{r coastal}
+world_coast     <- st_transform(world, 4326)
+coastline_coast <- st_make_valid(coastline_main) %>% st_transform(4326)
+coast_union     <- st_union(coastline_coast)
+
+coastal_dummy   <- lengths(st_intersects(world_coast, coast_union)) > 0
+dist_to_coast   <- st_distance(world_coast, coast_union)
+
+coast_df <- world_coast %>%
+  st_drop_geometry() %>%
+  mutate(
+    iso3          = adm0_a3,
+    coastal       = as.integer(coastal_dummy),
+    dist_coast_km = as.numeric(set_units(dist_to_coast, "km"))
+  ) %>%
+  select(iso3, coastal, dist_coast_km) %>%
+  mutate(dist_coast_km = if_else(coastal == 1, 0, dist_coast_km))
+
+head(coast_df)
+```
+
+### 2.6 Merge All Geographical Variables
+
+Combine the bilateral non-geographic panel with all spatial measures.
+
+```{r geo-merge}
+data_final_geo <- data_final %>%
+  left_join(dist_df, by = c("iso3_o", "iso3_d")) %>%
+  mutate(log_dist_centroid = log(dist_km)) %>%
+  left_join(pop_dist_df, by = c("iso3_o", "iso3_d")) %>%
+  mutate(log_dist_pop_centroid = log(pop_dist_km)) %>%
+  left_join(border_df, by = c("iso3_o", "iso3_d")) %>%
+  mutate(shared_border = replace_na(shared_border, 0)) %>%
+  left_join(coast_df, by = c("iso3_o" = "iso3")) %>%
+  rename(coastal_o = coastal, dist_coast_km_o = dist_coast_km) %>%
+  left_join(coast_df, by = c("iso3_d" = "iso3")) %>%
+  rename(coastal_d = coastal, dist_coast_km_d = dist_coast_km) %>%
+  mutate(diff_dist_coast_km = abs(dist_coast_km_o - dist_coast_km_d))
+```
+
+---
+
+## 3. Maps
+
+### 3.1 Static: Average Food Similarity
+
+The following heat maps show each country's average bilateral food similarity to all other countries for 20010 and 2023. The average food similarity can be interpreted as how "mainstream" the country's diet is.
+
+```{r map-avg-static, fig.width=10, fig.height=5}
+similarity_map <- data_final_geo %>%
+  group_by(iso3_o, year) %>%
+  summarise(mean_similarity = mean(similarity, na.rm = TRUE), .groups = "drop")
+
+world_map <- ne_countries(scale = "medium", returnclass = "sf") %>%
+  select(adm0_a3, geometry)
+
+map_data   <- world_map %>% left_join(similarity_map, by = c("adm0_a3" = "iso3_o"))
+plot_data  <- map_data %>% filter(year %in% c(2010, 2023))
+
+ggplot(data = plot_data) +
+  geom_sf(data = world_map, fill = "grey80", color = "white",
+          linewidth = 0.1, inherit.aes = FALSE) +
+  geom_sf(aes(fill = mean_similarity), color = "white", linewidth = 0.1) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey80",
+                       name = "Avg. Food\nSimilarity") +
+  facet_wrap(~ year) +
+  labs(title = "Average Food Similarity by Country: 2010 vs 2023",
+       caption = "Own calculations based on FAO Food Balance Sheets and Natural Earth data.") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+
+Food similarity is strongly regional in both years: Europe, North America, and parts of East Asia show relatively high similarity, while Sub-Saharan Africa and parts of Southeast Asia remain more distinct.
+
+From 2010 to 2023, there is a mild increase in similarity in several regions, suggesting some dietary convergence over time. However, the global pattern remains uneven, as low-similarity clusters persist, especially in Africa. This indicates that geography and regional factors still play a major role in shaping diets. 
+
+### 3.2 Interactive: Average Food Similarity
+
+Next, we generated an interactive map of average food similarity that allows a closer look into which countries exhibit particularly high and low similarity. Across both years, the distribution of extremes remains highly stable: Congo and Niger record the lowest similarity scores in both 2010 (6.4% and 7.1%) and 2023 (6.5% and 7.7%), showing only slight increases, while the highest values shift within a narrow range, from Syria (18.8%) and Saudi Arabia (18.4%) in 2010 to Jordan (18.8), Israel, and Slovenia (both 18.6) in 2023.
+
+```{r map-avg-leaflet}
+world_panel <- bind_rows(
+  world_main %>% select(adm0_a3, geometry) %>% mutate(year = 2010),
+  world_main %>% select(adm0_a3, geometry) %>% mutate(year = 2023)
+)
+
+map_avg_leaflet <- world_panel %>%
+  left_join(similarity_map, by = c("adm0_a3" = "iso3_o", "year" = "year")) %>%
+  st_transform(4326) %>%
+  mutate(hover_label = paste0(
+    adm0_a3, ": ",
+    ifelse(is.na(mean_similarity), "NA", paste0(round(mean_similarity, 1), "%"))
+  ))
+
+sim_range <- map_avg_leaflet %>%
+  filter(!is.na(mean_similarity)) %>%
+  summarise(min_sim = min(mean_similarity), max_sim = max(mean_similarity))
+
+pal <- colorNumeric("plasma", domain = c(sim_range$min_sim, sim_range$max_sim),
+                    na.color = "grey")
+
+leaflet(map_avg_leaflet) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(
+    data = dplyr::filter(map_avg_leaflet, year == 2010),
+    fillColor = ~ pal(mean_similarity), fillOpacity = 0.8,
+    color = "white", weight = 0.5, group = "2010",
+    highlight = highlightOptions(weight = 2, color = "#666",
+                                 fillOpacity = 0.9, bringToFront = TRUE),
+    label = ~ hover_label,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "13px", direction = "auto")
+  ) %>%
+  addPolygons(
+    data = dplyr::filter(map_avg_leaflet, year == 2023),
+    fillColor = ~ pal(mean_similarity), fillOpacity = 0.8,
+    color = "white", weight = 0.5, group = "2023",
+    highlight = highlightOptions(weight = 2, color = "#666",
+                                 fillOpacity = 0.9, bringToFront = TRUE),
+    label = ~ hover_label,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "13px", direction = "auto")
+  ) %>%
+  addLegend(pal = pal,
+            values = map_avg_leaflet$mean_similarity[!is.na(map_avg_leaflet$mean_similarity)],
+            title = "Avg. Food Similarity (%)", position = "bottomright",
+            na.label = "No data", opacity = 0.8) %>%
+  addLayersControl(baseGroups = c("2010", "2023"),
+                   options = layersControlOptions(collapsed = FALSE)) %>%
+  setView(lng = 0, lat = 20, zoom = 2)
+```
+
+### 3.3 Static: Food Similarity to China
+
+The following maps visualize how similar each country's diet is to China's. The maps reveal high similarity to China in East and Southeast Asia, as expected, but also notable similarity in parts of Europe, North America, and some South American countries such as Peru and Guyana. While the Asian pattern reflects geographic proximity and shared dietary staples, the similarities observed in regions like Europe and North America likely capture more globalized consumption patterns. In the case of Peru, the relatively high similarity is consistent with historical Chinese migration and its lasting influence on local diets, although the measure primarily reflects overlap in broad food categories rather than specific cuisines.
+
+```{r map-china-static, fig.width=10, fig.height=5}
+china_similarity <- similarity_merged %>%
+  filter(year %in% c(2010, 2023), iso3_o == "CHN" | iso3_d == "CHN") %>%
+  mutate(iso3 = if_else(iso3_o == "CHN", iso3_d, iso3_o)) %>%
+  select(iso3, year, similarity)
+
+china_similarity <- bind_rows(
+  china_similarity,
+  tibble(iso3 = "CHN", year = c(2010, 2023), similarity = 100)
+)
+
+world_map <- ne_countries(scale = "medium", returnclass = "sf") %>%
+  select(adm0_a3, geometry)
+
+map_china <- world_map %>%
+  left_join(china_similarity, by = c("adm0_a3" = "iso3")) %>%
+  filter(year %in% c(2010, 2023))
+
+world_map_bg <- bind_rows(
+  world_map %>% mutate(year = 2010),
+  world_map %>% mutate(year = 2023)
+)
+
+non_china_max <- map_china %>%
+  filter(adm0_a3 != "CHN", !is.na(similarity)) %>%
+  summarise(max_sim = max(similarity)) %>% pull(max_sim)
+
+ggplot() +
+  geom_sf(data = world_map_bg, fill = "grey80", color = "white",
+          linewidth = 0.1, inherit.aes = FALSE) +
+  geom_sf(data = map_china, aes(fill = similarity), color = "white", linewidth = 0.1) +
+  scale_fill_viridis_c(option = "plasma", limits = c(0, non_china_max),
+                       oob = scales::squish, na.value = "grey80",
+                       name = "Similarity\nto China") +
+  facet_wrap(~ year) +
+  labs(title = "Food Similarity to China: 2010 vs 2023",
+       caption = "Own calculations based on FAO Food Balance Sheets and Natural Earth data.") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### 3.4 Interactive: Food Similarity to China
+
+Again, the interactive version allows a more detailed view of food similarity to China. The highest food similiarity is observed in Korea (22.8%) in 2010 and India (21.7%) in 2023.
+
+```{r map-china-leaflet}
+world_panel <- bind_rows(
+  world_main %>% select(adm0_a3, geometry) %>% mutate(year = 2010),
+  world_main %>% select(adm0_a3, geometry) %>% mutate(year = 2023)
+)
+
+map_china_leaflet <- world_panel %>%
+  left_join(china_similarity, by = c("adm0_a3" = "iso3", "year" = "year")) %>%
+  st_transform(4326) %>%
+  mutate(hover_label = paste0(
+    adm0_a3, ": ",
+    ifelse(is.na(similarity), "NA", paste0(round(similarity, 1), "%"))
+  ))
+
+non_china_range <- map_china_leaflet %>%
+  filter(adm0_a3 != "CHN", !is.na(similarity)) %>%
+  summarise(min_sim = min(similarity), max_sim = max(similarity))
+
+pal <- colorNumeric("plasma",
+                    domain = c(non_china_range$min_sim, non_china_range$max_sim),
+                    na.color = "grey")
+
+leaflet(map_china_leaflet) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(
+    data = dplyr::filter(map_china_leaflet, year == 2010),
+    fillColor = ~ ifelse(adm0_a3 == "CHN", "pink", pal(similarity)),
+    fillOpacity = 0.8, color = "white", weight = 0.5, group = "2010",
+    highlight = highlightOptions(weight = 2, color = "#666",
+                                 fillOpacity = 0.9, bringToFront = TRUE),
+    label = ~ hover_label,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "13px", direction = "auto")
+  ) %>%
+  addPolygons(
+    data = dplyr::filter(map_china_leaflet, year == 2023),
+    fillColor = ~ ifelse(adm0_a3 == "CHN", "#222222", pal(similarity)),
+    fillOpacity = 0.8, color = "white", weight = 0.5, group = "2023",
+    highlight = highlightOptions(weight = 2, color = "#666",
+                                 fillOpacity = 0.9, bringToFront = TRUE),
+    label = ~ hover_label,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "13px", direction = "auto")
+  ) %>%
+  addLegend(
+    pal = pal,
+    values = map_china_leaflet$similarity[
+      map_china_leaflet$adm0_a3 != "CHN" & !is.na(map_china_leaflet$similarity)
+    ],
+    title = "Similarity to China (%)", position = "bottomright",
+    na.label = "No data", opacity = 0.8
+  ) %>%
+  addLayersControl(baseGroups = c("2010", "2023"),
+                   options = layersControlOptions(collapsed = FALSE)) %>%
+  setView(lng = 100, lat = 30, zoom = 2)
+```
+
+### 3.5 Static: Seafood Share of Diet (2023)
+
+The map depicts the share of fish and other seafood of total caloric intake. As expected, seafood consumption is highest in coastal and island regions, particularly in Southeast Asia and parts of Northern Europe, while inland regions, especially in Africa and Central Asia, show very low shares.
+
+```{r map-seafood, fig.width=9, fig.height=5}
+seafood_codes <- c(2761, 2762, 2763, 2764, 2765, 2766, 2767)
+
+seafood_shares <- food_merged %>%
+  filter(item_code %in% seafood_codes) %>%
+  group_by(iso3c) %>%
+  summarise(seafood_share = sum(share, na.rm = TRUE), .groups = "drop")
+
+map_seafood <- world_main %>%
+  select(adm0_a3, geometry) %>%
+  left_join(seafood_shares, by = c("adm0_a3" = "iso3c"))
+
+ggplot(map_seafood) +
+  geom_sf(aes(fill = seafood_share * 100), color = "white", linewidth = 0.1) +
+  scale_fill_viridis_c(option = "mako", na.value = "grey80",
+                       name = "Seafood Share\n(% of diet)", trans = "sqrt") +
+  labs(title = "Seafood Share of Total Diet (2023)",
+       subtitle = "Share of total caloric intake from seafood products",
+       caption = "Own calculations based on FAO Food Balance Sheets and Natural Earth data.") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+---
+
+## 4. Additional Visualisations
+
+### 4.1 Distribution of Pairwise Food Similarity
+
+The plot shows the distribution of pairwise food similarity. The distribution of pairwise food similarity shifts slightly to the right from 2010 to 2023, indicating a modest overall increase in similarity between countries. While the overall shape remains similar, the 2023 distribution shows fewer very low-similarity pairs and a higher concentration around mid-to-high similarity values, suggesting gradual convergence in global diets.
+
+```{r dist-overall, fig.width=7, fig.height=4}
+ggplot(data_final_geo, aes(x = similarity, fill = factor(year), color = factor(year))) +
+  geom_density(alpha = 0.4) +
+  scale_fill_manual(values  = c("2010" = "#2166ac", "2023" = "#d6604d"), name = "Year") +
+  scale_color_manual(values = c("2010" = "#2166ac", "2023" = "#d6604d"), name = "Year") +
+  labs(title = "Distribution of Pairwise Food Similarity",
+       x = "Food Similarity", y = "Density",
+       caption = "Source: Own calculations") +
+  theme_minimal()
+```
+
+### 4.2 Distribution by Food Category
+
+Below, we create density plots for three sub-categories: meat, starch, and fruits & vegetables. The distribution for meat shows the clearest rightward shift from 2010 to 2023, indicating higher similarity across countries in this category, whereas fruits & vegetables remain almost unchanged and starch shows only a modest shift. This suggests that the overall increase in food similarity is driven primarily by convergence in meat consumption patterns rather than by the other categories.
+
+```{r dist-categories, fig.width=9, fig.height=4}
+data_final_geo %>%
+  select(year, sim_meat, sim_starch, sim_fv) %>%
+  pivot_longer(cols = -year, names_to = "category", values_to = "similarity") %>%
+  mutate(category = recode(category,
+                           sim_meat   = "Meat",
+                           sim_starch = "Starch",
+                           sim_fv     = "Fruits & Vegetables")) %>%
+  ggplot(aes(x = similarity, fill = factor(year), color = factor(year))) +
+  geom_density(alpha = 0.4) +
+  scale_fill_manual(values  = c("2010" = "#2166ac", "2023" = "#d6604d"), name = "Year") +
+  scale_color_manual(values = c("2010" = "#2166ac", "2023" = "#d6604d"), name = "Year") +
+  facet_wrap(~ category) +
+  labs(title = "Distribution of Food Similarity by Category",
+       x = "Similarity", y = "Density",
+       caption = "Own calculations based on FAO Food Balance Sheets and Natural Earth data.") +
+  theme_minimal()
+```
